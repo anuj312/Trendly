@@ -51,7 +51,6 @@ LOOKBACK_SESSIONS = 20
 HOT_WINDOW_SEC = 5 * 60
 HOT_SAMPLE_SEC = 5
 # ---- FIX: retain enough history for the longest recency window (30 min) plus buffer ----
-HOT_HISTORY_MAX_SEC = max(1800, max(w for w, _ in RECENCY_WINDOWS) if 'RECENCY_WINDOWS' in globals() else 1800) + 10 * 60
 RFACTOR_LOG_SCALE = float(os.getenv("RFACTOR_LOG_SCALE", "3.5"))
 SECTOR_DIRR_DISPLAY_SCALE = float(os.getenv("SECTOR_DIRR_DISPLAY_SCALE", "1.95"))
 
@@ -106,6 +105,8 @@ RECENCY_WINDOWS = [
     (900,  0.35),   # 15 min
     (1800, 0.25),   # 30 min
 ]
+# Ensure we retain enough tick-history for the longest recency window + buffer
+HOT_HISTORY_MAX_SEC = max(HOT_WINDOW_SEC, max(w for w, _ in RECENCY_WINDOWS)) + 10 * 60
 
 # ---- NEW: RFactor weights (geometric mean) ----
 RFACTOR_W_VOL   = float(os.getenv("RFACTOR_W_VOL",   "0.5"))
@@ -300,16 +301,18 @@ def market_is_open_ist(now: Optional[datetime] = None) -> bool:
 
 def _record_tick_batch(count: int, last_dt: Optional[datetime]):
     global LAST_TICK_TS, LAST_TICK_DT, TOTAL_TICKS
+
     now = time.time()
-    TOTAL_TICKS += int(count)
+    with LOCK:
+        TOTAL_TICKS += int(count)
 
-    TPS_BUCKETS.append((now, int(count)))
-    cutoff = now - TPS_WINDOW_SEC
-    while TPS_BUCKETS and TPS_BUCKETS[0][0] < cutoff:
-        TPS_BUCKETS.popleft()
+        TPS_BUCKETS.append((now, int(count)))
+        cutoff = now - TPS_WINDOW_SEC
+        while TPS_BUCKETS and TPS_BUCKETS[0][0] < cutoff:
+            TPS_BUCKETS.popleft()
 
-    LAST_TICK_TS = now
-    LAST_TICK_DT = last_dt or datetime.now()
+        LAST_TICK_TS = now
+        LAST_TICK_DT = last_dt or datetime.now()
 
 
 def _hot_history_push(token: int, epoch: float, ltp: float, cumvol: Optional[float]):
@@ -335,32 +338,45 @@ def reset_daily_state_if_new_day():
     Clear all live state at the start of a new trading day (IST).
     This prevents yesterday's prices/volumes/EMA from contaminating today's calculations.
     """
-    global CURRENT_IST_DATE, DAILY_SEED_DONE, DAILY_SEED_PROGRESS, DAILY_SEED_ERRORS
-    today = datetime.now(IST).date()
-    today_str = str(today)
+    global CURRENT_IST_DATE
+    global DAILY_SEED_STARTED, DAILY_SEED_DONE, DAILY_SEED_PROGRESS, DAILY_SEED_ERRORS
+    global LAST_TICK_TS, LAST_TICK_DT, TOTAL_TICKS
+
+    today_str = str(datetime.now(IST).date())
 
     if CURRENT_IST_DATE is None:
         CURRENT_IST_DATE = today_str
         return
-    if CURRENT_IST_DATE != today_str:
-        log.info("New trading day detected (%s). Resetting live state.", today_str)
-        with LOCK:
-            LAST_PRICE.clear()
-            DAY_VOL.clear()
-            LAST_OHLC.clear()
-            HOT_HISTORY.clear()
-            RFACTOR_EMA.clear()
-            LAST_TICK_TIME_TOKEN.clear()
-            LAST_TICK_TS = 0.0
-            LAST_TICK_DT = None
-            TOTAL_TICKS = 0
-            TPS_BUCKETS.clear()
-        # Reset daily seed flags so we re-seed stats for the new day
-        DAILY_SEED_DONE = False
-        DAILY_SEED_PROGRESS = {"done": 0, "total": len(TOKENS)}
-        DAILY_SEED_ERRORS = 0
-        CURRENT_IST_DATE = today_str
 
+    if CURRENT_IST_DATE == today_str:
+        return
+
+    log.info("New trading day detected (%s). Resetting live state.", today_str)
+
+    with LOCK:
+        LAST_PRICE.clear()
+        DAY_VOL.clear()
+        LAST_OHLC.clear()
+        HOT_HISTORY.clear()
+        RFACTOR_EMA.clear()
+        LAST_TICK_TIME_TOKEN.clear()
+
+        LAST_TICK_TS = 0.0
+        LAST_TICK_DT = None
+        TOTAL_TICKS = 0
+
+        TPS_BUCKETS.clear()
+
+    # allow daily stats to rebuild for the new day
+    DAILY_SEED_STARTED = False
+    DAILY_SEED_DONE = False
+    DAILY_SEED_PROGRESS = {"done": 0, "total": len(TOKENS)}
+    DAILY_SEED_ERRORS = 0
+
+    CURRENT_IST_DATE = today_str
+
+    # kick off seeding again in background
+    seed_daily_stats_once(per_req_sleep=SEED_SLEEP_SEC)
 
 # =============================================================================
 # TICK PROCESSING
@@ -377,15 +393,23 @@ def update_from_tick(tick: dict):
 
     now_ts = time.time()
 
+    # IMPORTANT: update HOT_HISTORY under the same LOCK used by _snapshot_state
     with LOCK:
         LAST_PRICE[token] = float(ltp)
         if cumvol is not None:
             DAY_VOL[token] = float(cumvol)
         if ohlc:
             LAST_OHLC[token] = ohlc
+
         LAST_TICK_TIME_TOKEN[token] = now_ts
 
-    _hot_history_push(token, now_ts, float(ltp), float(cumvol) if cumvol is not None else None)
+        _hot_history_push(
+            token=token,
+            epoch=now_ts,
+            ltp=float(ltp),
+            cumvol=(float(cumvol) if cumvol is not None else None),
+        )
+
     return ts
 
 
@@ -1116,7 +1140,7 @@ def _compute_rfactor_row_snap(token: int, snap: Dict[str, Any], market_pct: floa
 
     # ---- SIDEWAYS / CONSOLIDATION DAMPENER (adaptive) ----
     # Use the stock's own average range to compute expected daily range %.
-    expected_range_pct = avg_range_20 / prev_close  # approx expected range % for the day
+    expected_range_pct = (avg_range_20 / prev_close) * 100.0  # expected daily range in percent
     if expected_range_pct <= 0:
         inactivity_mult = 1.0
     else:
@@ -1829,6 +1853,12 @@ def start_compute_loop_once():
 _started = False
 
 
+# =============================================================================
+# TICKER
+# =============================================================================
+_started = False
+
+
 def start_ticker_once():
     global _started
     if _started:
@@ -1848,12 +1878,13 @@ def start_ticker_once():
                 def on_ticks(ws, ticks):
                     try:
                         last_dt = None
-                        with LOCK:
-                            for t in ticks:
-                                ts = update_from_tick(t)
-                                if ts and (last_dt is None or ts > last_dt):
-                                    last_dt = ts
-                            _record_tick_batch(len(ticks), last_dt)
+                        for t in ticks:
+                            ts = update_from_tick(t)
+                            if ts and (last_dt is None or ts > last_dt):
+                                last_dt = ts
+
+                        _record_tick_batch(len(ticks), last_dt)
+
                     except Exception:
                         log.exception("on_ticks crashed")
 
@@ -1861,6 +1892,7 @@ def start_ticker_once():
                 kws.on_ticks = on_ticks
                 kws.connect(threaded=True)
 
+                # Keep thread alive; KiteTicker runs in its own thread internally
                 while True:
                     time.sleep(2)
 
@@ -1869,7 +1901,6 @@ def start_ticker_once():
                 time.sleep(5)
 
     threading.Thread(target=_run, daemon=True).start()
-
 
 # =============================================================================
 # DASH APP
