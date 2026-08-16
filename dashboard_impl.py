@@ -50,7 +50,7 @@ LOOKBACK_SESSIONS = 20
 # Hot Now window
 HOT_WINDOW_SEC = 5 * 60
 HOT_SAMPLE_SEC = 5
-# ---- FIX: retain enough history for the longest recency window (30 min) plus buffer ----
+
 RFACTOR_LOG_SCALE = float(os.getenv("RFACTOR_LOG_SCALE", "3.5"))
 SECTOR_DIRR_DISPLAY_SCALE = float(os.getenv("SECTOR_DIRR_DISPLAY_SCALE", "1.95"))
 
@@ -1852,13 +1852,6 @@ def start_compute_loop_once():
 # =============================================================================
 _started = False
 
-
-# =============================================================================
-# TICKER
-# =============================================================================
-_started = False
-
-
 def start_ticker_once():
     global _started
     if _started:
@@ -1892,7 +1885,6 @@ def start_ticker_once():
                 kws.on_ticks = on_ticks
                 kws.connect(threaded=True)
 
-                # Keep thread alive; KiteTicker runs in its own thread internally
                 while True:
                     time.sleep(2)
 
